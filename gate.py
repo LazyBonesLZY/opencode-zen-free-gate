@@ -94,6 +94,7 @@ MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 # 主动探测间隔（秒）：对槽位做轻量 /v1/models 探测。探测也消耗共享账号，
 # 默认 300 秒一次，避免探测流量触发账号级 429。
 PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "300"))
+PROBE_FAILURES = int(os.environ.get("PROBE_FAILURES", "2"))
 
 # 全节点测速：RANK_INTERVAL 触发一轮遍历，RANK_REFRESH 为单节点测速缓存时长。
 # /v1/models 是 GET 不计入生成配额，可较频繁刷新全池排名；
@@ -306,6 +307,23 @@ def model_node_in_cooldown(model, node):
     with model_node_cooldown_lock:
         until = model_node_cooldown.get((model, node), 0)
     return until > time.time()
+
+
+# 模型×节点 成功记忆：该模型在此节点成功过 → 优先复用（POST 通的出口很稀少）
+model_node_ok = {}
+model_node_ok_lock = threading.Lock()
+
+
+def note_model_node_ok(model, node):
+    if model and node:
+        with model_node_ok_lock:
+            model_node_ok[(model, node)] = time.time()
+
+
+def model_node_was_ok(model, node, ttl=86400):
+    with model_node_ok_lock:
+        ts = model_node_ok.get((model, node), 0)
+    return (time.time() - ts) < ttl
 
 
 def acquire_contributor_gate():
@@ -733,7 +751,7 @@ def switch_and_probe(slot_idx, skip, reason, max_try=5):
 
 
 
-def switch_v4(slot_idx, skip, reason=""):
+def switch_v4(slot_idx, skip, reason="", model=""):
     skip = skip or set()
     with v4_switch_lock, slot_route_locks[slot_idx]:
         all_nodes, now = get_manual_state(slot_idx)
@@ -747,12 +765,16 @@ def switch_v4(slot_idx, skip, reason=""):
         with egress_ip_lock:
             used_ips = {egress_ip[n] for n in used if n in egress_ip}
             known_ips = dict(egress_ip)
+        # 候选排除：全局冷却 + 该模型的地区/限流冷却（否则 403 的节点会被反复选中）
         candidates = [n for n in all_nodes
-                      if n not in skip and not node_in_cooldown(n)]
+                      if n not in skip and not node_in_cooldown(n)
+                      and not (model and model_node_in_cooldown(model, n))]
         free = [n for n in candidates if n not in used and
                 (n not in known_ips or known_ips[n] not in used_ips)]
         pool = free or candidates
-        pool.sort(key=lambda n: (get_node_latency(n) is None,
+        # 排序：该模型成功过的节点最优先 → 已知低延迟 → 未测随机
+        pool.sort(key=lambda n: (0 if model_node_was_ok(model, n) else 1,
+                                 get_node_latency(n) is None,
                                  get_node_latency(n) or 10 ** 9,
                                  random.random()))
         for node in pool:
@@ -794,20 +816,20 @@ def switch_v6(slot_idx, skip, reason=""):
     return False
 
 
-def switch_slot(slot_idx, skip=None, reason=""):
+def switch_slot(slot_idx, skip=None, reason="", model=""):
     if slots[slot_idx]["mode"] == "v6":
         return switch_v6(slot_idx, skip, reason)
-    return switch_v4(slot_idx, skip, reason)
+    return switch_v4(slot_idx, skip, reason, model=model)
 
 
-def switch_slot_if_current(slot_idx, expected_node, skip=None, reason=""):
+def switch_slot_if_current(slot_idx, expected_node, skip=None, reason="", model=""):
     """Switch only if another concurrent request has not switched it already."""
     switch_lock = v4_switch_lock if slot_idx >= V6_ACCOUNTS else slot_route_locks[slot_idx]
     with switch_lock, slot_route_locks[slot_idx]:
         with slots_lock:
             if slots[slot_idx].get("current_node") != expected_node:
                 return True
-        return switch_slot(slot_idx, skip, reason)
+        return switch_slot(slot_idx, skip, reason, model=model)
 
 
 def cooldown_node(slot_idx, node, seconds):
@@ -827,6 +849,7 @@ def init_slots():
             "cooldown_until": {}, "last_switch": 0, "switched": 0,
             "state": ST_UNKNOWN, "since": time.time(),
             "last_429": 0, "last_error": 0,
+            "probe_failures": 0,
         }
         slots.append(slot)
         accounts.append({
@@ -836,12 +859,32 @@ def init_slots():
             "errors": 0, "tokens": 0,
         })
     # init V4 slots: spread across distinct egress IPs (quota is per-IP)
+    # 且按订阅轮转（A1→A2→A4→…），避免 8 个槽位全落在同一订阅上
     all_nodes = []
     for _ in range(10):
         all_nodes, _ = get_manual_state(V6_ACCOUNTS)
         if all_nodes:
             break
         time.sleep(1)
+    # 按订阅前缀分组后交错排列：A1[0], A2[0], A4[0], A1[1], A2[1], ...
+    by_sub = {}
+    for n in all_nodes:
+        by_sub.setdefault(n.split("|", 1)[0], []).append(n)
+    subs = sorted(by_sub)
+    interleaved = []
+    idx = 0
+    while len(interleaved) < len(all_nodes):
+        progressed = False
+        for s in subs:
+            if idx < len(by_sub[s]):
+                interleaved.append(by_sub[s][idx])
+                progressed = True
+                if len(interleaved) >= len(all_nodes):
+                    break
+        if not progressed:
+            break
+        idx += 1
+    all_nodes = interleaved
     # 用第一个 V4 槽位作为临时探测通道：逐个临时切换候选节点，探测其真实出口 IP，
     # 挑选出口 IP 互不相同的节点分配给各槽位，保证 8 个槽位覆盖 8 个独立配额。
     probe_slot_idx = V6_ACCOUNTS
@@ -1123,18 +1166,31 @@ def load_models_cache():
 # dispatch() 每次请求后调用 record_result() 刷新节点/线路状态。
 
 def record_result(slot_idx, node, ok, status, latency_ms):
+    transition = None
     with slots_lock:
         slot = slots[slot_idx]
         slot["ok"] = ok
-        slot["latency_ms"] = latency_ms if ok else None
         slot["last_check"] = time.time()
+        if ok:
+            slot["latency_ms"] = latency_ms
+            slot["probe_failures"] = 0
+        else:
+            slot["probe_failures"] = slot.get("probe_failures", 0) + 1
         if ok and slot["state"] != ST_OPERATIONAL:
             prev = slot["state"]
             slot["state"] = ST_OPERATIONAL
             slot["since"] = time.time()
-            push_timeline(accounts[slot_idx]["name"],
-                          prev, ST_OPERATIONAL, "recovered")
+            transition = (prev, ST_OPERATIONAL, "recovered")
+        elif not ok and slot["probe_failures"] >= PROBE_FAILURES and \
+                slot["state"] != ST_DOWN:
+            prev = slot["state"]
+            slot["state"] = ST_DOWN
+            slot["latency_ms"] = None
+            slot["since"] = time.time()
+            transition = (prev, ST_DOWN, "probe_fail")
         mode = slot["mode"]
+    if transition:
+        push_timeline(accounts[slot_idx]["name"], *transition)
     with node_health_lock:
         node_health[node] = {"latency_ms": latency_ms if ok else None,
                              "ok": ok, "mode": mode,
@@ -1182,6 +1238,13 @@ def probe_all_slots():
                 slot = slots[i]
             record_result(i, slot["current_node"], False, 0, None)
             log("探测 slot-%d 失败: %s" % (i, str(e)[:80]))
+            with slots_lock:
+                failures = slots[i].get("probe_failures", 0)
+                failed_node = slots[i].get("current_node")
+            if failures >= PROBE_FAILURES and failed_node:
+                if switch_slot_if_current(i, failed_node, {failed_node},
+                                          "(探测失败)"):
+                    set_slot_state(i, ST_UNKNOWN, "probe_switch")
 
 
 def probe_loop():
@@ -1212,6 +1275,26 @@ def rank_probe_all():
         if ts and (now - ts) < RANK_REFRESH:
             continue
         targets.append(n)
+    # 未测过的节点优先（补齐延迟数据），再按订阅交错，避免偏向单一订阅
+    targets.sort(key=lambda n: 0 if n not in [x for x in targets
+                 if (lambda t: t is not None)(node_latency.get(n, (None, 0))[0])] else 1)
+    by_sub = {}
+    for n in targets:
+        by_sub.setdefault(n.split("|", 1)[0], []).append(n)
+    interleaved = []
+    idx = 0
+    while len(interleaved) < len(targets):
+        progressed = False
+        for s in sorted(by_sub):
+            if idx < len(by_sub[s]):
+                interleaved.append(by_sub[s][idx])
+                progressed = True
+                if len(interleaved) >= len(targets):
+                    break
+        if not progressed:
+            break
+        idx += 1
+    targets = interleaved
     # 轮流用 8 个 V4 槽位的 mihomo delay API 测速，分摊请求压力。
     api_pool = [v4_api(i) for i in range(V6_ACCOUNTS, TOTAL)]
     for target_idx, node in enumerate(targets):
@@ -1440,7 +1523,15 @@ def dispatch(account_idx, path, method, req_headers, body, stream):
                     release_node()
                     stats["rateLimited"] += 1
                     acct["rateLimited"] += 1
-                    cooldown_model_node(model, node, 60)
+                    # 429 冷却时长：优先上游 Retry-After（额度重置时间），
+                    # 无则默认 600s；到期自动释放（时间戳比较自然过期）
+                    ra = up.headers.get("retry-after")
+                    try:
+                        cd = int(ra) if ra else 600
+                    except ValueError:
+                        cd = 600
+                    cd = min(max(cd, 60), 86400)
+                    cooldown_model_node(model, node, cd)
                     if upstream_circuit:
                         upstream_circuit.record_failure()
                     with slots_lock:
@@ -1449,8 +1540,8 @@ def dispatch(account_idx, path, method, req_headers, body, stream):
                         ip = egress_ip.get(node)
                     if ip:
                         tried_ips.add(ip)
-                    log("[429] %s(%s) 出口 %s 限流，切换出口重试"
-                        % (acct["name"], slot["mode"], ip or node))
+                    log("[429] %s(%s) 出口 %s 限流，冷却 %ds 后释放"
+                        % (acct["name"], slot["mode"], ip or node, cd))
                     if fallback_state and fallback_state.should_fallback(model, 429):
                         fallback_state.mark_keyed(model)
                         log(f"[key] 模型 {model} 429 达阈值，切 key")
@@ -1460,10 +1551,13 @@ def dispatch(account_idx, path, method, req_headers, body, stream):
                     skip_tried = tried | {n for n, ip2 in skip_ips.items()
                                           if ip2 in tried_ips}
                     try:
-                        switch_slot_if_current(sidx, node, skip_tried, "(429)")
+                        switch_slot_if_current(sidx, node, skip_tried, "(429)", model=model)
                     except Exception:
                         pass
                     if total_attempts >= max_attempts:
+                        break
+                    # 本槽位连吃 2 次 429 → 直接跳下一个槽位（别在本槽死磕）
+                    if attempt >= 2:
                         break
                     continue
                 if up.status >= 500:
@@ -1491,7 +1585,7 @@ def dispatch(account_idx, path, method, req_headers, body, stream):
                     skip_tried = tried | {n for n, ip2 in skip_ips.items()
                                           if ip2 in tried_ips}
                     try:
-                        switch_slot_if_current(sidx, node, skip_tried, "(%d)" % up.status)
+                        switch_slot_if_current(sidx, node, skip_tried, "(%d)" % up.status, model=model)
                     except Exception:
                         pass
                     if total_attempts >= max_attempts:
@@ -1525,7 +1619,7 @@ def dispatch(account_idx, path, method, req_headers, body, stream):
                         skip_tried = tried | {n for n, ip2 in skip_ips.items()
                                               if ip2 in tried_ips}
                         try:
-                            switch_slot_if_current(sidx, node, skip_tried, "(403)")
+                            switch_slot_if_current(sidx, node, skip_tried, "(403)", model=model)
                         except Exception:
                             pass
                         if total_attempts >= max_attempts:
@@ -1539,6 +1633,8 @@ def dispatch(account_idx, path, method, req_headers, body, stream):
                 # success (2xx) pass through
                 record_result(sidx, node, up.status < 400,
                               up.status, latency if up.status < 400 else None)
+                # 记住该模型在此节点成功过，后续优先复用此出口
+                note_model_node_ok(model, node)
                 if upstream_circuit:
                     upstream_circuit.record_success()
                 if fallback_state:
@@ -1563,13 +1659,19 @@ def dispatch(account_idx, path, method, req_headers, body, stream):
                 stats["errors"] += 1
                 acct["errors"] += 1
                 cooldown_global(node, 60)
+                # 连接失败/超时也按模型冷却，避免同一模型反复撞死节点
+                cooldown_model_node(model, node, 300)
                 with slots_lock:
                     slots[sidx]["last_error"] = time.time()
-                set_slot_state(sidx, ST_DOWN, "connection_error", str(e)[:50])
+                    slots[sidx]["probe_failures"] = \
+                        slots[sidx].get("probe_failures", 0) + 1
+                    failures = slots[sidx]["probe_failures"]
+                if failures >= PROBE_FAILURES:
+                    set_slot_state(sidx, ST_DOWN, "connection_error", str(e)[:50])
                 log("[!] %s(%s) 节点 %s 连接失败: %s → 切换 (attempt %d)"
                     % (acct["name"], slot["mode"], node, str(e)[:50], attempt))
                 try:
-                    switch_slot_if_current(sidx, node, tried, "(连接失败)")
+                    switch_slot_if_current(sidx, node, tried, "(连接失败)", model=model)
                 except Exception:
                     pass
                 if total_attempts >= max_attempts:
@@ -1801,6 +1903,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if pathname == "/api/models/refresh" and method == "POST":
             threading.Thread(target=fetch_models, daemon=True).start()
             self._json(200, {"success": True, "msg": "刷新中"})
+            return
+        if pathname == "/api/probe" and method == "POST":
+            threading.Thread(target=probe_all_slots, daemon=True).start()
+            self._json(200, {"success": True, "msg": "出口探测中"})
             return
         if pathname == "/api/switch" and method == "POST":
             raw = self._read_body()
