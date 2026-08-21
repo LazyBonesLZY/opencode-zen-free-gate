@@ -2364,12 +2364,71 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 response = chat_completion_to_responses(raw, client_model)
-                events = []
-                for item in response.get("output", []):
+                events = [
+                    ("response.created", {
+                        "type": "response.created",
+                        "response": {"id": response.get("id"),
+                                     "object": "response", "status": "in_progress",
+                                     "model": response.get("model"), "output": []}}),
+                    ("response.in_progress", {
+                        "type": "response.in_progress",
+                        "response": {"id": response.get("id"),
+                                     "object": "response", "status": "in_progress",
+                                     "model": response.get("model"), "output": []}}),
+                ]
+                for output_index, item in enumerate(response.get("output", [])):
+                    added_item = dict(item)
+                    added_item["status"] = "in_progress"
+                    if item.get("type") == "message":
+                        added_item["content"] = []
                     events.append(("response.output_item.added", {
-                        "type": "response.output_item.added", "item": item}))
+                        "type": "response.output_item.added",
+                        "output_index": output_index, "item": added_item}))
+                    if item.get("type") == "message":
+                        for content_index, part in enumerate(item.get("content", [])):
+                            empty_part = dict(part)
+                            empty_part["text"] = ""
+                            events.append(("response.content_part.added", {
+                                "type": "response.content_part.added",
+                                "item_id": item.get("id"),
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "part": empty_part}))
+                            text = part.get("text", "")
+                            if text:
+                                events.append(("response.output_text.delta", {
+                                    "type": "response.output_text.delta",
+                                    "item_id": item.get("id"),
+                                    "output_index": output_index,
+                                    "content_index": content_index,
+                                    "delta": text}))
+                            events.append(("response.output_text.done", {
+                                "type": "response.output_text.done",
+                                "item_id": item.get("id"),
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "text": text}))
+                            events.append(("response.content_part.done", {
+                                "type": "response.content_part.done",
+                                "item_id": item.get("id"),
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "part": part}))
+                    elif item.get("type") == "function_call":
+                        arguments = item.get("arguments", "{}")
+                        events.append(("response.function_call_arguments.delta", {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item.get("id"),
+                            "output_index": output_index,
+                            "delta": arguments}))
+                        events.append(("response.function_call_arguments.done", {
+                            "type": "response.function_call_arguments.done",
+                            "item_id": item.get("id"),
+                            "output_index": output_index,
+                            "arguments": arguments}))
                     events.append(("response.output_item.done", {
-                        "type": "response.output_item.done", "item": item}))
+                        "type": "response.output_item.done",
+                        "output_index": output_index, "item": item}))
                 events.append(("response.completed", {
                     "type": "response.completed", "response": response}))
                 for event, payload in events:
