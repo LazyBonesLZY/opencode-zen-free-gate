@@ -1389,6 +1389,115 @@ def chat_to_responses_body(body: str) -> str:
         return body
 
 
+def responses_to_chat_body(body: str) -> str:
+    """Convert Responses input/tools to Chat Completions, including tool results."""
+    try:
+        p = json.loads(body) if body else {}
+        messages = []
+        pending_calls = []
+        for item in p.get("input") or []:
+            if not isinstance(item, dict):
+                continue
+            typ = item.get("type", "")
+            if typ == "function_call":
+                pending_calls.append({
+                    "id": item.get("call_id") or item.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                })
+                continue
+            if typ == "function_call_output":
+                if pending_calls:
+                    messages.append({"role": "assistant", "content": "",
+                                     "tool_calls": pending_calls})
+                    pending_calls = []
+                messages.append({"role": "tool",
+                                 "tool_call_id": item.get("call_id"),
+                                 "content": str(item.get("output", ""))})
+                continue
+            role = item.get("role")
+            if role:
+                content = item.get("content", "")
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            parts.append(part.get("text") or
+                                         part.get("input_text") or
+                                         part.get("output_text") or "")
+                        else:
+                            parts.append(str(part))
+                    content = "".join(parts)
+                messages.append({"role": role, "content": content})
+        if pending_calls:
+            messages.append({"role": "assistant", "content": "",
+                             "tool_calls": pending_calls})
+        # Some Responses clients only replay call/output. Chat providers reject
+        # a history starting with assistant/tool, so add a neutral context item.
+        if messages and messages[0].get("role") in ("assistant", "tool"):
+            messages.insert(0, {"role": "user",
+                                "content": "Continue using the tool result."})
+        tools = []
+        for tool in p.get("tools") or []:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "function" and "function" not in tool:
+                tools.append({"type": "function", "function": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("parameters", {"type": "object"}),
+                }})
+            else:
+                tools.append(tool)
+        out = {"model": p.get("model"), "messages": messages,
+               "stream": False}
+        if tools:
+            out["tools"] = tools
+        choice = p.get("tool_choice")
+        if choice:
+            out["tool_choice"] = choice
+        for key in ("temperature", "top_p", "max_tokens"):
+            if key in p:
+                out[key] = p[key]
+        return json.dumps(out)
+    except Exception:
+        return body
+
+
+def chat_completion_to_responses(raw: str, alias_model=""):
+    """Convert a non-stream Chat completion to a Responses response."""
+    d = json.loads(raw)
+    choice = (d.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    output = []
+    for call in msg.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        output.append({"id": call.get("id"), "type": "function_call",
+                       "name": fn.get("name", ""),
+                       "call_id": call.get("id"),
+                       "arguments": fn.get("arguments", "{}")})
+    content = msg.get("content") or ""
+    if content:
+        output.append({"id": "msg_" + str(d.get("id", "")),
+                       "type": "message", "status": "completed",
+                       "role": "assistant", "content": [
+                           {"type": "output_text", "text": content,
+                            "annotations": [], "logprobs": []}]})
+    usage = d.get("usage") or {}
+    return {
+        "id": d.get("id"), "object": "response", "status": "completed",
+        "model": alias_model or d.get("model"), "output": output,
+        "stop_reason": "tool_call" if msg.get("tool_calls") else
+                       choice.get("finish_reason"),
+        "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                  "output_tokens": usage.get("completion_tokens", 0),
+                  "total_tokens": usage.get("total_tokens", 0)},
+    }
+
+
 def chat_to_messages_body(body: str) -> str:
     try:
         p = json.loads(body) if body else {}
@@ -2083,6 +2192,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path.startswith("/openai/v1/"):
             path = path[len("/openai"):]
+        inbound_path = path
         body = self._read_body() if self.command in ("POST", "PUT") else ""
         if body is None:
             return  # 413 already sent
@@ -2117,11 +2227,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
             req_model = mapped_model
         outbound_proto = None
+        response_conversion = ""
         if resolve_outbound_protocol:
             outbound_proto = resolve_outbound_protocol(req_model, ZEN_MODEL_ENDPOINTS)
             if outbound_proto == "responses" and path == "/v1/chat/completions":
                 path = "/v1/responses"
                 body = chat_to_responses_body(body)
+            elif outbound_proto == "chat" and path == "/v1/responses":
+                path = "/v1/chat/completions"
+                body = responses_to_chat_body(body)
+                response_conversion = "chat_to_responses"
             elif outbound_proto == "messages" and path not in ("/v1/messages",):
                 path = "/v1/messages"
                 body = chat_to_messages_body(body)
@@ -2142,9 +2257,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             req_headers = build_upstream_headers(self.headers, body)
             t0 = time.time()
             if stream:
-                self._proxy_stream(path, self.command, req_headers, body, acct)
+                self._proxy_stream(path, self.command, req_headers, body, acct,
+                                   response_conversion, req_model)
             else:
-                self._proxy_plain(path, self.command, req_headers, body, acct, t0)
+                self._proxy_plain(path, self.command, req_headers, body, acct, t0,
+                                  response_conversion, req_model)
             # probe anon recovery when keyed
             if fallback_state and fallback_state.is_keyed(req_model):
                 if fallback_state.try_probe_recover(req_model):
@@ -2163,7 +2280,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if contributor:
                 release_contributor_gate()
 
-    def _proxy_plain(self, path, method, headers, body, acct, t0):
+    def _proxy_plain(self, path, method, headers, body, acct, t0,
+                     response_conversion="", client_model=""):
         stats["total"] += 1
         up = dispatch(acct["index"], path, method, headers, body, stream=False)
         raw = b"".join(up.body_iter).decode("utf-8", "replace")
@@ -2175,7 +2293,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pt = ct = tt = 0
         resp_body = raw
         ctype = up.headers.get("content-type", "application/json")
-        if path == "/v1/models" and up.status == 200:
+        if response_conversion == "chat_to_responses" and up.status == 200:
+            try:
+                resp_body = json.dumps(
+                    chat_completion_to_responses(raw, client_model),
+                    ensure_ascii=False)
+                ctype = "application/json"
+            except Exception:
+                pass
+        elif path == "/v1/models" and up.status == 200:
             try:
                 d = json.loads(raw)
                 all_m = d.get("data", d.get("models", []))
@@ -2206,7 +2332,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _proxy_stream(self, path, method, headers, body, acct):
+    def _proxy_stream(self, path, method, headers, body, acct,
+                      response_conversion="", client_model=""):
         stats["total"] += 1
         up = dispatch(acct["index"], path, method, headers, body, stream=True)
         stats["success"] += 1 if up.status < 400 else 0
@@ -2229,6 +2356,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             audit(up.status, 0, "", path)
+            return
+        if response_conversion == "chat_to_responses":
+            # Conversion requests use a non-stream Chat upstream response.
+            # Emit canonical Responses SSE events for streaming clients.
+            raw = b"".join(up.body_iter).decode("utf-8", "replace")
+            self.end_headers()
+            try:
+                response = chat_completion_to_responses(raw, client_model)
+                events = []
+                for item in response.get("output", []):
+                    events.append(("response.output_item.added", {
+                        "type": "response.output_item.added", "item": item}))
+                    events.append(("response.output_item.done", {
+                        "type": "response.output_item.done", "item": item}))
+                events.append(("response.completed", {
+                    "type": "response.completed", "response": response}))
+                for event, payload in events:
+                    data = ("event: %s\ndata: %s\n\n" %
+                            (event, json.dumps(payload, ensure_ascii=False))).encode()
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                audit(up.status, 0, client_model, path)
+            except Exception as e:
+                log("工具响应转换失败: %s" % str(e)[:80])
             return
         self.end_headers()
         model = ""
