@@ -1,0 +1,22 @@
+# runtime / local config
+config.env
+data/gate_key
+data/stats.json
+data/audit.jsonl
+data/timeline.json
+data/models_cache.json
+data/nodes.json
+data/node_ips.json
+data/sub*.yaml
+data/*.yaml
+data/*.mmdb
+data/*.dat
+slots/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.env
+.venv/
+venv/

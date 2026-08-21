@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenCode Zen Free Proxy Status</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="page-wrap">
+    <header class="masthead">
+      <div class="masthead-wrap">
+        <div class="masthead-inner">
+          <div class="logo-mark" aria-hidden="true">Z</div>
+          <div class="masthead-text">
+            <h1>OpenCode Zen Free</h1>
+            <span class="masthead-sub">Proxy Status</span>
+          </div>
+        </div>
+        <div class="masthead-meta">
+          <span id="mastStatus" class="mast-status skel-pill"></span>
+          <span id="lastSync" class="meta-text">等待同步…</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="content">
+      <div id="statusBanner" class="status-banner status-unknown">
+        <div class="banner-icon" aria-hidden="true">
+          <svg class="icon-check" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          <svg class="icon-warn" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <svg class="icon-error" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+          <svg class="icon-unknown" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        </div>
+        <div class="banner-text">
+          <h2 id="bannerTitle">等待数据…</h2>
+          <p id="bannerSub" class="banner-sub"></p>
+        </div>
+      </div>
+
+      <section class="components-section">
+        <h3 class="section-title">用量统计</h3>
+        <div class="components-list">
+          <div class="component-row token-total-row">
+            <span class="component-name muted">总用量</span>
+            <div id="tokenTotal" class="token-total">
+              <span class="skel skel-token"></span>
+              <span class="skel skel-token"></span>
+              <span class="skel skel-token"></span>
+            </div>
+          </div>
+          <div id="tokenByModel" class="token-chips">
+            <span class="skel skel-chip"></span>
+            <span class="skel skel-chip"></span>
+            <span class="skel skel-chip"></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="components-section">
+        <h3 class="section-title">出口池</h3>
+        <div id="slots" class="components-list">
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+          <div class="component-row skel-row"><span class="skel skel-name"></span><div class="slot-badges"><span class="skel skel-mini"></span><span class="skel skel-mini"></span></div><span class="skel skel-pill"></span></div>
+        </div>
+      </section>
+
+      <section class="components-section">
+        <h3 class="section-title">可用模型</h3>
+        <div class="components-list">
+          <div class="component-row" id="freeModels">
+            <span class="skel skel-chip"></span>
+            <span class="skel skel-chip"></span>
+            <span class="skel skel-chip"></span>
+            <span class="skel skel-chip"></span>
+            <span class="skel skel-chip"></span>
+            <span class="skel skel-chip"></span>
+            <span class="skel skel-chip"></span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="page-footer">
+      <span class="muted">OpenCode Zen Free · 每 5 秒自动刷新</span>
+      <span id="footerMeta" class="muted footer-meta"></span>
+    </footer>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
