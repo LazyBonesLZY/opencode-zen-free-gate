@@ -27,12 +27,11 @@
 
 ## 机场代理落地
 
-- **订阅来源**：`refresh_sub.sh` 内的 `SUB_URL_*`，拉取失败回退到 `clashctl/resources/profiles/*.yaml`。
-- **IP 解析**：`resolve_node_ips.py` 通过 `Cloudflare DoH` 经本机代理解析节点 `server` 为真实 IP，写入 `data/node_ips.json`。
+- **订阅来源**：`config.env` 中的 `SUB_URL_*`（见 `config.env.example`），拉取失败可回退到本地缓存。
+- **IP 解析**：`resolve_node_ips.py` 通过 `Cloudflare DoH` 解析节点 `server` 为真实 IP，写入 `data/node_ips.json`。
 - **槽位生成**：`slots_gen.py` 合并订阅并生成 `SLOTS` 个 `mihomo` 槽位（每个 `mixed-port 10800+i` / `controller 10990+i`），均标记 `routing-mark=FW_MARK`。
 - **默认端口与标记**：`config.env` 中 `V4` 槽固定 `10800` 起，控制器 `10990` 起，`fwmark 0xca7`。
-- **迁移/复用**：迁移机器时只需复制 `config.env` 里的订阅 URL 与 `data/sub*.yaml`，运行 `opencode-refresh.service` 即可重建 `slots/`。
-- **系统 clash 隔离**：主 `clashctl` 进程 `mihomo -d /home/lzy/clashctl/resources -f runtime.yaml` 监听 `7890/7891`，网关 `slots/slot-*` 使用独立配置目录，不共享状态。
+- **迁移/复用**：迁移机器时只需在新机配置 `config.env` 的订阅 URL，运行 `opencode-refresh.service` 即可重建 `slots/`。
 
 ## 参考与致谢
 
